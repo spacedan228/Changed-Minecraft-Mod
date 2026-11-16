@@ -5,6 +5,7 @@ import net.ltxprogrammer.changed.Changed;
 import net.ltxprogrammer.changed.ability.IAbstractChangedEntity;
 import net.ltxprogrammer.changed.block.StasisChamber;
 import net.ltxprogrammer.changed.computers.BasicNIC;
+import net.ltxprogrammer.changed.computers.application.StasisChamberControllerApplication;
 import net.ltxprogrammer.changed.computers.protocol.*;
 import net.ltxprogrammer.changed.entity.*;
 import net.ltxprogrammer.changed.entity.ai.ImmediateTransfurDecision;
@@ -16,6 +17,7 @@ import net.ltxprogrammer.changed.item.FluidCanister;
 import net.ltxprogrammer.changed.item.Syringe;
 import net.ltxprogrammer.changed.process.ProcessTransfur;
 import net.ltxprogrammer.changed.util.EntityUtil;
+import net.ltxprogrammer.changed.world.inventory.ComputerMenu;
 import net.ltxprogrammer.changed.world.inventory.StasisChamberMenu;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.NonNullList;
@@ -24,11 +26,11 @@ import net.minecraft.nbt.ListTag;
 import net.minecraft.nbt.StringTag;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.protocol.game.ClientboundBlockEntityDataPacket;
+import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.util.Mth;
 import net.minecraft.util.RandomSource;
-import net.minecraft.world.CompoundContainer;
 import net.minecraft.world.ContainerHelper;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
@@ -49,7 +51,9 @@ import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.material.Fluid;
 import net.minecraft.world.level.material.WaterFluid;
 import net.minecraft.world.phys.AABB;
+import net.minecraftforge.common.IExtensibleEnum;
 import net.minecraftforge.network.NetworkHooks;
+import org.apache.commons.lang3.NotImplementedException;
 import org.jetbrains.annotations.NotNull;
 
 import javax.annotation.Nullable;
@@ -58,6 +62,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BiConsumer;
 import java.util.function.Function;
 import java.util.function.Predicate;
 
@@ -72,7 +77,11 @@ public class StasisChamberBlockEntity extends BaseContainerBlockEntity implement
     private LivingEntity cachedEntity;
     private final BasicNIC nic;
 
-    protected static final Set<Class<?>> PROTOCOLS = Set.of(DiscoveryProtocol.class, DoorControlProtocol.class, DeviceInfoProtocol.Query.class);
+    protected static final Set<Class<?>> PROTOCOLS = Set.of(DiscoveryProtocol.class, DoorControlProtocol.class, DeviceInfoProtocol.Query.class,
+            StasisChamberControlProtocol.class,
+            StasisChamberControlProtocol.InputProgram.class,
+            StasisChamberControlProtocol.SetModifications.class,
+            StasisChamberControlProtocol.SetWaitDuration.class);
 
     private final ContainerOpenersCounter openersCounter = new ContainerOpenersCounter() {
         protected void onOpen(Level level, BlockPos blockPos, BlockState blockState) {
@@ -88,17 +97,12 @@ public class StasisChamberBlockEntity extends BaseContainerBlockEntity implement
         }
 
         protected boolean isOwnContainer(Player player) {
-            if (!(player.containerMenu instanceof StasisChamberMenu)) {
-                return false;
-            } else {
-                if (player.containerMenu instanceof StasisChamberMenu stasisMenu)
-                    return stasisMenu.blockEntity == StasisChamberBlockEntity.this;
-
-                if (((StasisChamberMenu)player.containerMenu).container instanceof CompoundContainer compoundContainer)
-                    compoundContainer.contains(StasisChamberBlockEntity.this);
-
-                return false;
+            if (player.containerMenu instanceof StasisChamberMenu stasisMenu) {
+                return stasisMenu.blockEntity == StasisChamberBlockEntity.this;
+            } else if (player.containerMenu instanceof ComputerMenu computerMenu && computerMenu.currentApplication() instanceof StasisChamberControllerApplication app) {
+                return app.inspectingChamber == StasisChamberBlockEntity.this;
             }
+            return false;
         }
     };
 
@@ -385,6 +389,13 @@ public class StasisChamberBlockEntity extends BaseContainerBlockEntity implement
                     Changed.modResource("stasis_chamber")
             ));
         }
+
+        if (packet instanceof StasisChamberControlProtocol.InputProgram inputProgram)
+            inputProgram.program.input(this, inputProgram.controller);
+        if (packet instanceof StasisChamberControlProtocol.SetModifications setModifications)
+            this.applyModifications(setModifications.modifications);
+        if (packet instanceof StasisChamberControlProtocol.SetWaitDuration setWaitDuration)
+            this.setWaitDuration(setWaitDuration.ticks, setWaitDuration.controller);
     }
 
     public static void serverTick(Level level, BlockPos blockPos, BlockState blockState, StasisChamberBlockEntity blockEntity) {
@@ -396,7 +407,7 @@ public class StasisChamberBlockEntity extends BaseContainerBlockEntity implement
         }
 
         var commands = blockEntity.scheduledCommands;
-        if (commands.isEmpty() && !blockEntity.getEntitiesWithin().isEmpty()) {
+        if (commands.isEmpty() && !blockEntity.getEntitiesCompletelyWithin().isEmpty()) {
             // No scheduled work, ensure entities within can leave
             commands.add(ScheduledCommand.DRAIN);
             commands.add(ScheduledCommand.RELEASE);
@@ -477,7 +488,32 @@ public class StasisChamberBlockEntity extends BaseContainerBlockEntity implement
         return isFilled() && getChamberedLatex().isPresent();
     }
 
-    public <T extends Entity> List<T> getEntitiesWithin(Class<T> clazz) {
+    protected static boolean isBoundingBoxCompletelyWithin(AABB smallBox, AABB bigBox) {
+        // AABB.contains() treats the upper bound (maxX, maxY, maxZ) as exclusive.
+        // This method treats it as inclusive
+        var min = smallBox.minX >= bigBox.minX && smallBox.minX <= bigBox.maxX &&
+                smallBox.minY >= bigBox.minY && smallBox.minY <= bigBox.maxY &&
+                smallBox.minZ >= bigBox.minZ && smallBox.minZ <= bigBox.maxZ;
+        var max = smallBox.maxX >= bigBox.minX && smallBox.maxX <= bigBox.maxX &&
+                smallBox.maxY >= bigBox.minY && smallBox.maxY <= bigBox.maxY &&
+                smallBox.maxZ >= bigBox.minZ && smallBox.maxZ <= bigBox.maxZ;
+        return min && max;
+    }
+
+    public <T extends Entity> List<T> getEntitiesInside(Class<T> clazz) {
+        if (!(this.getBlockState().getBlock() instanceof StasisChamber chamber)) {
+            return List.of();
+        }
+
+        AABB detectionBox = chamber.getDetectionSize(this.getBlockState(), level, this.getBlockPos());
+        Level level = getLevel();
+        if (level == null)
+            return List.of();
+
+        return level.getEntitiesOfClass(clazz, detectionBox);
+    }
+
+    public <T extends Entity> List<T> getEntitiesCompletelyWithin(Class<T> clazz) {
         if (!(this.getBlockState().getBlock() instanceof StasisChamber chamber)) {
             return List.of();
         }
@@ -494,27 +530,30 @@ public class StasisChamberBlockEntity extends BaseContainerBlockEntity implement
                 var entity = iterator.next();
                 AABB entityBox = entity.getBoundingBox();
 
-                if (!(detectionBox.contains(entityBox.minX, entityBox.minY, entityBox.minZ) &&
-                        detectionBox.contains(entityBox.maxX, entityBox.maxY, entityBox.maxZ)))
+                if (!isBoundingBoxCompletelyWithin(entityBox, detectionBox))
                     iterator.remove();
             }
         }
         return entities;
     }
 
-    public List<LivingEntity> getEntitiesWithin() {
-        return getEntitiesWithin(LivingEntity.class);
+    public List<LivingEntity> getEntitiesCompletelyWithin() {
+        return getEntitiesCompletelyWithin(LivingEntity.class);
     }
 
-    public List<Player> getPlayersWithin() {
-        return getEntitiesWithin(Player.class).stream()
+    public List<LivingEntity> getEntitiesInside() {
+        return getEntitiesInside(LivingEntity.class);
+    }
+
+    public List<Player> getPlayersCompletelyWithin() {
+        return getEntitiesCompletelyWithin(Player.class).stream()
                 .filter(entity -> entity instanceof Player)
                 .map(entity -> (Player)entity)
                 .toList();
     }
 
     public boolean ensureCapturedIsStillInside() {
-        var entities = getEntitiesWithin();
+        var entities = getEntitiesCompletelyWithin();
 
         if (cachedEntity == null) {
             cachedEntity = entities.stream().findAny().orElse(null);
@@ -536,7 +575,7 @@ public class StasisChamberBlockEntity extends BaseContainerBlockEntity implement
     public boolean isPlayerAllowedToConfigure(@Nullable Player controller) {
         if (controller == null)
             return true; // Unknown packet origin (shouldn't be possible on server-side)
-        var players = getPlayersWithin();
+        var players = getPlayersCompletelyWithin();
         if (players.isEmpty())
             return true; // No players within the chamber
 
@@ -608,121 +647,6 @@ public class StasisChamberBlockEntity extends BaseContainerBlockEntity implement
         }
     }
 
-    public void inputProgram(String program, @Nullable ServerPlayer controller) {
-        if ("transfur".equals(program) && !scheduledCommands.contains(ScheduledCommand.TRANSFUR_ENTITY)) {
-            trimSchedule();
-
-            scheduledCommands.add(ScheduledCommand.OPEN);
-            scheduledCommands.add(ScheduledCommand.CAPTURE_ENTITY);
-            scheduledCommands.add(ScheduledCommand.FILL);
-            scheduledCommands.add(ScheduledCommand.TRANSFUR_ENTITY);
-
-            scheduledCommands.add(ScheduledCommand.DRAIN);
-            scheduledCommands.add(ScheduledCommand.RELEASE);
-            scheduledCommands.add(ScheduledCommand.CLOSE_WHEN_EMPTY);
-            markUpdated();
-        }
-
-        else if ("modify".equals(program) && !scheduledCommands.contains(ScheduledCommand.MODIFY_ENTITY)) {
-            trimSchedule();
-
-            scheduledCommands.add(ScheduledCommand.OPEN);
-            scheduledCommands.add(ScheduledCommand.CAPTURE_ENTITY);
-            scheduledCommands.add(ScheduledCommand.FILL);
-            scheduledCommands.add(ScheduledCommand.MODIFY_ENTITY);
-
-            scheduledCommands.add(ScheduledCommand.DRAIN);
-            scheduledCommands.add(ScheduledCommand.RELEASE);
-            scheduledCommands.add(ScheduledCommand.CLOSE_WHEN_EMPTY);
-            markUpdated();
-        }
-
-        else if ("captureNextEntity".equals(program) && !scheduledCommands.contains(ScheduledCommand.CAPTURE_ENTITY)) {
-            trimSchedule();
-
-            scheduledCommands.add(ScheduledCommand.OPEN);
-            scheduledCommands.add(ScheduledCommand.CAPTURE_ENTITY);
-            scheduledCommands.add(ScheduledCommand.WAIT);
-            if (waitDuration < 200 && this.isPlayerAllowedToConfigure(controller))
-                waitDuration = 200; // Default 10 seconds
-
-            scheduledCommands.add(ScheduledCommand.DRAIN);
-            scheduledCommands.add(ScheduledCommand.RELEASE);
-            scheduledCommands.add(ScheduledCommand.CLOSE_WHEN_EMPTY);
-            markUpdated();
-        }
-
-        else if ("toggleStasis".equals(program)) {
-            if (stabilized || scheduledCommands.contains(ScheduledCommand.STABILIZE_ENTITY) || currentCommand == ScheduledCommand.STABILIZE_ENTITY) {
-                trimSchedule();
-
-                currentCommand = ScheduledCommand.WAKE_ENTITY;
-                scheduledCommands.add(ScheduledCommand.WAIT);
-                if (waitDuration < 400 && this.isPlayerAllowedToConfigure(controller))
-                    waitDuration = 400; // Default 20 seconds
-
-                scheduledCommands.add(ScheduledCommand.DRAIN);
-                scheduledCommands.add(ScheduledCommand.RELEASE);
-                scheduledCommands.add(ScheduledCommand.CLOSE_WHEN_EMPTY);
-                markUpdated();
-
-                markUpdated();
-            } else {
-                trimSchedule();
-
-                scheduledCommands.add(ScheduledCommand.OPEN);
-                scheduledCommands.add(ScheduledCommand.CAPTURE_ENTITY);
-                scheduledCommands.add(ScheduledCommand.FILL);
-                scheduledCommands.add(ScheduledCommand.STABILIZE_ENTITY);
-                scheduledCommands.add(ScheduledCommand.WAIT);
-                if (waitDuration < 400 && this.isPlayerAllowedToConfigure(controller))
-                    waitDuration = 400; // Default 20 seconds
-
-                scheduledCommands.add(ScheduledCommand.DRAIN);
-                scheduledCommands.add(ScheduledCommand.RELEASE);
-                scheduledCommands.add(ScheduledCommand.CLOSE_WHEN_EMPTY);
-                markUpdated();
-            }
-        }
-
-        else if ("createEntity".equals(program) && !scheduledCommands.contains(ScheduledCommand.CREATE_ENTITY)) {
-            trimSchedule();
-
-            scheduledCommands.add(ScheduledCommand.CLOSE_WHEN_EMPTY);
-            scheduledCommands.add(ScheduledCommand.FILL);
-            scheduledCommands.add(ScheduledCommand.CREATE_ENTITY);
-            scheduledCommands.add(ScheduledCommand.STABILIZE_ENTITY);
-            scheduledCommands.add(ScheduledCommand.WAIT);
-            if (waitDuration < 600 && this.isPlayerAllowedToConfigure(controller))
-                waitDuration = 600; // Default 30 seconds
-
-            scheduledCommands.add(ScheduledCommand.DRAIN);
-            scheduledCommands.add(ScheduledCommand.RELEASE);
-            scheduledCommands.add(ScheduledCommand.CLOSE_WHEN_EMPTY);
-            markUpdated();
-        }
-
-        else if ("discardEntity".equals(program) && !scheduledCommands.contains(ScheduledCommand.DISCARD_ENTITY)) {
-            trimSchedule();
-
-            scheduledCommands.add(ScheduledCommand.DISCARD_ENTITY);
-
-            scheduledCommands.add(ScheduledCommand.DRAIN);
-            scheduledCommands.add(ScheduledCommand.RELEASE);
-            scheduledCommands.add(ScheduledCommand.CLOSE_WHEN_EMPTY);
-            markUpdated();
-        }
-
-        else if ("abort".equals(program) && !scheduledCommands.contains(ScheduledCommand.DISCARD_ENTITY)) {
-            currentCommand = ScheduledCommand.DRAIN;
-            scheduledCommands.clear();
-            scheduledCommands.add(ScheduledCommand.RELEASE);
-            scheduledCommands.add(ScheduledCommand.CLOSE_WHEN_EMPTY);
-
-            markUpdated();
-        }
-    }
-
     public enum ScheduledCommand {
         /**
          * Opens the chamber door.
@@ -740,7 +664,7 @@ public class StasisChamberBlockEntity extends BaseContainerBlockEntity implement
          * Requires: Chamber door is open.
          */
         CAPTURE_ENTITY("capture_entity", StasisChamberBlockEntity::isOpen, blockEntity -> {
-            var entities = blockEntity.getEntitiesWithin();
+            var entities = blockEntity.getEntitiesCompletelyWithin();
             if (entities.size() != 1)
                 return true; // Execute again
             blockEntity.cachedEntity = entities.get(0);
@@ -960,7 +884,7 @@ public class StasisChamberBlockEntity extends BaseContainerBlockEntity implement
          * Requires: Chamber door is closed and the chamber is drained.
          */
         RELEASE("release", StasisChamberBlockEntity::isClosedAndDrained, blockEntity -> {
-            if (blockEntity.getEntitiesWithin().isEmpty())
+            if (blockEntity.getEntitiesInside().isEmpty())
                 return false; // No entities inside, no need to open
             if (blockEntity.getBlockState().getBlock() instanceof StasisChamber chamber) {
                 chamber.openDoor(blockEntity.getBlockState(), blockEntity.getLevel(), blockEntity.getBlockPos());
@@ -973,7 +897,7 @@ public class StasisChamberBlockEntity extends BaseContainerBlockEntity implement
          * Requires: Chamber door is open.
          */
         CLOSE_WHEN_EMPTY("close_when_empty", StasisChamberBlockEntity::isOpen, blockEntity -> {
-            if (!blockEntity.getEntitiesWithin().isEmpty())
+            if (!blockEntity.getEntitiesInside().isEmpty())
                 return true;
             if (blockEntity.getBlockState().getBlock() instanceof StasisChamber chamber) {
                 chamber.closeDoor(blockEntity.getBlockState(), blockEntity.getLevel(), blockEntity.getBlockPos());
@@ -1014,6 +938,149 @@ public class StasisChamberBlockEntity extends BaseContainerBlockEntity implement
 
         public Component getActiveDisplayText() {
             return Component.translatable("changed.stasis.command._active", getDisplayText());
+        }
+    }
+
+    public enum Program implements IExtensibleEnum {
+        TRANSFUR(Changed.modResource("transfur"), (self, controller) -> {
+            if (self.scheduledCommands.contains(ScheduledCommand.TRANSFUR_ENTITY)) return;
+
+            self.trimSchedule();
+            self.scheduledCommands.add(ScheduledCommand.OPEN);
+            self.scheduledCommands.add(ScheduledCommand.CAPTURE_ENTITY);
+            self.scheduledCommands.add(ScheduledCommand.FILL);
+            self.scheduledCommands.add(ScheduledCommand.TRANSFUR_ENTITY);
+
+            self.scheduledCommands.add(ScheduledCommand.DRAIN);
+            self.scheduledCommands.add(ScheduledCommand.RELEASE);
+            self.scheduledCommands.add(ScheduledCommand.CLOSE_WHEN_EMPTY);
+            self.markUpdated();
+        }),
+        MODIFY(Changed.modResource("modify"), (self, controller) -> {
+            if (self.scheduledCommands.contains(ScheduledCommand.MODIFY_ENTITY)) return;
+
+            self.trimSchedule();
+            self.scheduledCommands.add(ScheduledCommand.OPEN);
+            self.scheduledCommands.add(ScheduledCommand.CAPTURE_ENTITY);
+            self.scheduledCommands.add(ScheduledCommand.FILL);
+            self.scheduledCommands.add(ScheduledCommand.MODIFY_ENTITY);
+
+            self.scheduledCommands.add(ScheduledCommand.DRAIN);
+            self.scheduledCommands.add(ScheduledCommand.RELEASE);
+            self.scheduledCommands.add(ScheduledCommand.CLOSE_WHEN_EMPTY);
+            self.markUpdated();
+        }),
+        CAPTURE_NEXT_ENTITY(Changed.modResource("capture_next_entity"), (self, controller) -> {
+            if (self.scheduledCommands.contains(ScheduledCommand.CAPTURE_ENTITY)) return;
+
+            self.trimSchedule();
+            self.scheduledCommands.add(ScheduledCommand.OPEN);
+            self.scheduledCommands.add(ScheduledCommand.CAPTURE_ENTITY);
+            self.scheduledCommands.add(ScheduledCommand.WAIT);
+            if (self.waitDuration < 200 && self.isPlayerAllowedToConfigure(controller))
+                self.waitDuration = 200; // Default 10 seconds
+
+            self.scheduledCommands.add(ScheduledCommand.DRAIN);
+            self.scheduledCommands.add(ScheduledCommand.RELEASE);
+            self.scheduledCommands.add(ScheduledCommand.CLOSE_WHEN_EMPTY);
+            self.markUpdated();
+        }),
+        TOGGLE_STASIS(Changed.modResource("toggle_stasis"), (self, controller) -> {
+            if (self.stabilized || self.scheduledCommands.contains(ScheduledCommand.STABILIZE_ENTITY) || self.currentCommand == ScheduledCommand.STABILIZE_ENTITY) {
+                self.trimSchedule();
+
+                self.currentCommand = ScheduledCommand.WAKE_ENTITY;
+                self.scheduledCommands.add(ScheduledCommand.WAIT);
+                if (self.waitDuration < 400 && self.isPlayerAllowedToConfigure(controller))
+                    self.waitDuration = 400; // Default 20 seconds
+
+                self.scheduledCommands.add(ScheduledCommand.DRAIN);
+                self.scheduledCommands.add(ScheduledCommand.RELEASE);
+                self.scheduledCommands.add(ScheduledCommand.CLOSE_WHEN_EMPTY);
+                self.markUpdated();
+            } else {
+                self.trimSchedule();
+
+                self.scheduledCommands.add(ScheduledCommand.OPEN);
+                self.scheduledCommands.add(ScheduledCommand.CAPTURE_ENTITY);
+                self.scheduledCommands.add(ScheduledCommand.FILL);
+                self.scheduledCommands.add(ScheduledCommand.STABILIZE_ENTITY);
+                self.scheduledCommands.add(ScheduledCommand.WAIT);
+                if (self.waitDuration < 400 && self.isPlayerAllowedToConfigure(controller))
+                    self.waitDuration = 400; // Default 20 seconds
+
+                self.scheduledCommands.add(ScheduledCommand.DRAIN);
+                self.scheduledCommands.add(ScheduledCommand.RELEASE);
+                self.scheduledCommands.add(ScheduledCommand.CLOSE_WHEN_EMPTY);
+                self.markUpdated();
+            }
+        }),
+        CREATE_ENTITY(Changed.modResource("create_entity"), (self, controller) -> {
+            if (self.scheduledCommands.contains(ScheduledCommand.CREATE_ENTITY)) return;
+
+            self.trimSchedule();
+
+            self.scheduledCommands.add(ScheduledCommand.CLOSE_WHEN_EMPTY);
+            self.scheduledCommands.add(ScheduledCommand.FILL);
+            self.scheduledCommands.add(ScheduledCommand.CREATE_ENTITY);
+            self.scheduledCommands.add(ScheduledCommand.STABILIZE_ENTITY);
+            self.scheduledCommands.add(ScheduledCommand.WAIT);
+            if (self.waitDuration < 600 && self.isPlayerAllowedToConfigure(controller))
+                self.waitDuration = 600; // Default 30 seconds
+
+            self.scheduledCommands.add(ScheduledCommand.DRAIN);
+            self.scheduledCommands.add(ScheduledCommand.RELEASE);
+            self.scheduledCommands.add(ScheduledCommand.CLOSE_WHEN_EMPTY);
+            self.markUpdated();
+        }),
+        DISCARD_ENTITY(Changed.modResource("discard_entity"), (self, controller) -> {
+            if (self.scheduledCommands.contains(ScheduledCommand.DISCARD_ENTITY)) return;
+
+            self.trimSchedule();
+
+            self.scheduledCommands.add(ScheduledCommand.DISCARD_ENTITY);
+
+            self.scheduledCommands.add(ScheduledCommand.DRAIN);
+            self.scheduledCommands.add(ScheduledCommand.RELEASE);
+            self.scheduledCommands.add(ScheduledCommand.CLOSE_WHEN_EMPTY);
+            self.markUpdated();
+        }),
+        ABORT(Changed.modResource("abort"), (self, controller) -> {
+            self.currentCommand = ScheduledCommand.DRAIN;
+            self.scheduledCommands.clear();
+            self.scheduledCommands.add(ScheduledCommand.RELEASE);
+            self.scheduledCommands.add(ScheduledCommand.CLOSE_WHEN_EMPTY);
+
+            self.markUpdated();
+        });
+
+        private final ResourceLocation id;
+        private final BiConsumer<StasisChamberBlockEntity, ServerPlayer> handleInput;
+
+        Program(ResourceLocation id, BiConsumer<StasisChamberBlockEntity, ServerPlayer> handleInput) {
+            this.id = id;
+            this.handleInput = handleInput;
+        }
+
+        public static Program create(String enumName, ResourceLocation id, BiConsumer<StasisChamberBlockEntity, ServerPlayer> handleInput) {
+            throw new NotImplementedException("Enum not extended");
+        }
+
+        public ResourceLocation getId() {
+            return id;
+        }
+
+        public void input(StasisChamberBlockEntity blockEntity, @Nullable ServerPlayer controller) {
+            handleInput.accept(blockEntity, controller);
+        }
+
+        public static Program getFromID(ResourceLocation id) {
+            for (var v : values()) {
+                if (v.id.equals(id))
+                    return v;
+            }
+
+            return null;
         }
     }
 }
